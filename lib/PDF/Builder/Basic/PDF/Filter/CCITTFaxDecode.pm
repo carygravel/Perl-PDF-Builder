@@ -284,31 +284,42 @@ sub encode{
     my $damagedRowsBeforeError = $config{damagedRowsBeforeError} // 0;
     $byteAlign = 1; # FIXME: this overwrites the value passed to the sub
     $stream = unpack('B*', $stream);
-    print "in encode with $stream\n";
+    print "in encode with $stream, $rows, $columns\n";
     my ($white, $black) = (1,0);
     if ($blackIs1) {
         ($white, $black) = (0,1)
     }
     my $bitw = PDF::Builder::Basic::PDF::Filter::CCITTFaxDecode::Bit::Writer->new();
     my $pos = 0;
-    my $col = 0;
-    my $rowend = $columns;
-    my ($current_color, $next_color) = ($white, $black);
-    print "before eol ", sprintf("%0$EOL[1]b", $EOL[0]), "\n";
-    $bitw->write( sprintf("%0$EOL[1]b", $EOL[0]), $byteAlign );
+    my $rowend = 0;
+    while ( $rows > 0 ){
+        if ($byteAlign) {
+            my $pad = $pos % 8;
+            print "rows $rows pos $pos pad $pad\n";
+            if ($pad > 0) {
+                $pos += 8 - ($pad % 8)
+            }
+        }
+        $rowend = $pos + $columns;
+        print "rows $rows pos $pos rowend $rowend\n";
+        my ($current_color, $next_color) = ($white, $black);
+        print "before eol ", sprintf("%0$EOL[1]b", $EOL[0]), "\n";
+        $bitw->write( sprintf("%0$EOL[1]b", $EOL[0]), $byteAlign );
 
-    while ($pos < $rowend) {
-        print "in while pos $pos\n";
-        my $codelen;
-        if ($current_color == $white) {
-            ($codelen, $pos) = $self->encode_white_bits($stream, $pos, $rowend, $current_color);
+        while ($pos < $rowend) {
+            print "in while pos $pos\n";
+            my $codelen;
+            if ($current_color == $white) {
+                ($codelen, $pos) = $self->encode_white_bits($stream, $pos, $rowend, $current_color);
+            }
+            else {
+                ($codelen, $pos) = $self->encode_black_bits($stream, $pos, $rowend, $current_color);
+            }
+            my ($code, $len) = @{$codelen};
+            $bitw->write( sprintf("%0$len".'b', $code) );
+            ($current_color, $next_color) = ($next_color, $current_color);
         }
-        else {
-            ($codelen, $pos) = $self->encode_black_bits($stream, $pos, $rowend, $current_color);
-        }
-        my ($code, $len) = @{$codelen};
-        $bitw->write( sprintf("%0$len".'b', $code) );
-        ($current_color, $next_color) = ($next_color, $current_color);
+        $rows -= 1;
     }
     $bitw->flush;
     return $bitw->{data}
@@ -377,9 +388,9 @@ sub decode{
     while (not ( $bitr->eod_p() or $rows == 0 )){
         print "in while\n";
         my $current_color = $white;
-        if ($byteAlign and $bitr->pos % 8 != 0){
-            $bitr->pos += 8 - ($bitr->pos % 8)
-        }
+#        if ($byteAlign and $bitr->pos % 8 != 0){
+#            $bitr->pos($bitr->pos + 8 - ($bitr->pos % 8))
+#        }
 
         use Data::Dumper;
         print "RTC ", Dumper(\@RTC);
@@ -389,11 +400,13 @@ sub decode{
             last
         }
 
-        print "before peek eol ", Dumper(\@EOL);
         my $peek_size = $EOL[1];
+        print "before peek eol size $peek_size ", Dumper(\@EOL);
+        print "pos ", $bitr->pos, " mod ", ($bitr->pos + $peek_size) % 8, "\n";
         if ($byteAlign) {
-            $peek_size += $peek_size % 8
+            $peek_size += 8 - (($bitr->pos + $peek_size) % 8)
         }
+        print "aligned to $peek_size\n";
         if ($bitr->peek($peek_size) == $EOL[0]){
             print "got eol. before pos update ", $bitr->pos, "\n";
             $bitr->pos($bitr->pos + $peek_size);
@@ -431,9 +444,9 @@ sub decode{
             $current_color ^= 1
         }
 
-        $rows -= 1
+        $rows -= 1;
+        $bitw->flush;
     }
-    $bitw->flush;
     print "returning from decode with ", unpack('B*', $bitw->{data}), "\n";
     return $bitw->{data}
 }
@@ -509,7 +522,7 @@ sub write {
     my $length = length($data);
     print "in write with data $data length $length at last_byte $self->{last_byte}\n";
 
-    my $pad = ($length + length($self->{last_byte})) % 8;
+    my $pad = 8 - ($length + length($self->{last_byte})) % 8;
     print "pad $pad\n";
     if ($byteAlign and $pad != 0){
         $data = ('0' x $pad).$data;

@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use Carp;
 use POSIX;
+use feature 'switch';
 use base 'PDF::Builder::Basic::PDF::Filter::FlateDecode';
 
 # VERSION
@@ -31,6 +32,23 @@ use Readonly;
 Readonly my @EOL => codeword('000000000001');
 print Dumper(\@EOL);
 Readonly my @RTC => codeword('000000000001' x 6);
+Readonly my @EOFB => codeword('000000000001' x 2);
+
+Readonly my %MODE_ENCODE_TABLE => {
+    'P' => [codeword('0001')],
+    'H' => [codeword('001')],
+    'V0' => [codeword('1')],
+    'VR1' => [codeword('011')],
+    'VR2' => [codeword('000011')],
+    'VR3' => [codeword('0000011')],
+    'VL1' => [codeword('010')],
+    'VL2' => [codeword('000010')],
+    'VL3' => [codeword('0000010')],
+};
+print Dumper(\%MODE_ENCODE_TABLE);
+
+Readonly my %MODE_DECODE_TABLE => map { $MODE_ENCODE_TABLE{$_}[0].' '. $MODE_ENCODE_TABLE{$_}[1] => $_ } keys %MODE_ENCODE_TABLE;
+print Dumper(\%MODE_DECODE_TABLE);
 
 use Data::Dumper;
 Readonly my %WHITE_TERMINAL_ENCODE_TABLE => {
@@ -272,7 +290,7 @@ sub new {
     return bless $self, $class;
 }
 
-sub encode{
+sub encode_group3{
     my ($self, $stream, $rows, $columns, %config) = @_;
     my $k = $config{k} // 0;  # // is defined-or, added in Perl 5.10.
     my $eol = $config{eol} // 1;
@@ -302,25 +320,112 @@ sub encode{
         }
         $rowend = $pos + $columns;
         print "rows $rows pos $pos rowend $rowend\n";
-        my ($current_color, $next_color) = ($white, $black);
+        my $color = $white;
         print "before eol ", sprintf("%0$EOL[1]b", $EOL[0]), "\n";
         $bitw->write( sprintf("%0$EOL[1]b", $EOL[0]), $byteAlign );
 
         while ($pos < $rowend) {
             print "in while pos $pos\n";
             my $codelen;
-            if ($current_color == $white) {
-                ($codelen, $pos) = $self->encode_white_bits($stream, $pos, $rowend, $current_color);
+            if ($color == $white) {
+                ($codelen, $pos) = $self->encode_white_bits($stream, $pos, $rowend, $color);
             }
             else {
-                ($codelen, $pos) = $self->encode_black_bits($stream, $pos, $rowend, $current_color);
+                ($codelen, $pos) = $self->encode_black_bits($stream, $pos, $rowend, $color);
             }
             my ($code, $len) = @{$codelen};
             $bitw->write( sprintf("%0$len".'b', $code) );
-            ($current_color, $next_color) = ($next_color, $current_color);
+            $color ^= 1;
         }
         $rows -= 1;
     }
+    $bitw->flush;
+    return $bitw->{data}
+}
+
+sub encode_group4{
+    my ($self, $stream, $rows, $columns, %config) = @_;
+    my $k = $config{k} // 0;  # // is defined-or, added in Perl 5.10.
+    my $eol = $config{eol} // 1;
+    my $byteAlign = $config{byteAlign} // 0;
+#    $columns = $config{columns} // 1728;
+#    $rows = $config{rows} // 0;
+    my $eob = $config{eob} // 1;
+    my $blackIs1 = $config{blackIs1} // 0;
+    my $damagedRowsBeforeError = $config{damagedRowsBeforeError} // 0;
+    $byteAlign = 1; # FIXME: this overwrites the value passed to the sub
+    $stream = unpack('B*', $stream);
+    print "in encode with $stream, $rows, $columns\n";
+    my ($white, $black) = (1,0);
+    if ($blackIs1) {
+        ($white, $black) = (0,1)
+    }
+    my $bitw = PDF::Builder::Basic::PDF::Filter::CCITTFaxDecode::Bit::Writer->new();
+    my $pos = 0;
+    my $rowend = 0;
+    my $ref = $white x $columns;
+    my $b1 = $columns;
+    my $b2 = $b1;
+    my $a0 = -1;
+    while ( $rows > 0 ){
+        if ($byteAlign) {
+            my $pad = $pos % 8;
+            print "rows $rows pos $pos pad $pad\n";
+            if ($pad > 0) {
+                $pos += 8 - ($pad % 8)
+            }
+        }
+        $rowend = $pos + $columns;
+        print "rows $rows pos $pos rowend $rowend\n";
+        my $color = $white;
+        while ($pos < $rowend) {
+            my $a1 = $self->find_next_changing_bit($stream, $pos, $rowend, $color);
+            print "a0 $a0 a1 $a1 b1 $b1 b2 $b2\n";
+            if ($b2 < $a1) { # pass mode
+                croak "pass"
+            }
+            elsif (abs($b1-$a1) > 3) { # horizontal mode
+                print "horizontal\n";
+                my ($codelen) = $MODE_ENCODE_TABLE{H};
+                my ($code, $len) = @{$codelen};
+#                print "code $code, len $len\n";
+                $bitw->write( sprintf("%0$len".'b', $code) );
+#                my $a2 = $self->find_next_changing_bit($stream, $a1, $rowend, not $color);
+                ($codelen, $pos) = $self->encode_white_bits($stream, $pos, $rowend, $color);
+                ($code, $len) = @{$codelen};
+                $bitw->write( sprintf("%0$len".'b', $code) );
+                $color ^= 1;
+                ($codelen, $pos) = $self->encode_black_bits($stream, $pos, $rowend, $color);
+                ($code, $len) = @{$codelen};
+                $bitw->write( sprintf("%0$len".'b', $code) );
+                $a0 = $pos;
+#                $a0 = $a2;
+#                $pos = $a2;
+            }
+            else { # vertical mode
+                print "vertical\n";
+                my $code = 'V';
+                if ($a1 == $b1) {
+                    $code .= '0';
+                }
+                elsif ($a1 < $b1) {
+                    $code .= sprintf('L%d', $b1-$a1);
+                }
+                else {
+                    $code .= sprintf('R%d', $a1-$b1);
+                }
+                print "code $code\n";
+                my ($codelen) = $MODE_ENCODE_TABLE{$code};
+                my ($code, $len) = @{$codelen};
+                print "code $code, len $len\n";
+                $bitw->write( sprintf("%0$len".'b', $code) );
+                $pos = $a1;
+            }
+            $color ^= 1;
+        }
+        $rows -= 1;
+    }
+    $bitw->write( sprintf("%0$EOFB[1]b", $EOFB[0]) );
     $bitw->flush;
     return $bitw->{data}
 }
@@ -341,12 +446,11 @@ sub encode_black_bits{
     return $self->encode_color_bits( $stream, $pos, $rowend, \%BLACK_CONFIGURATION_ENCODE_TABLE, \%BLACK_TERMINAL_ENCODE_TABLE, $color )
 }
 
+# FIXME: this should call find_next_changing_bit()
 sub encode_color_bits{
 #    my ($self, $bitr, $config_words, $term_words, $color)=@_;
     my ($self, $stream, $pos, $rowend, $config_words, $term_words, $color)=@_;
     print "in encode_color_bits with $stream, pos $pos, rowend $rowend, color $color\n";
-    my $bits = 0;
-    my $check_conf = 1;
 
     my $run = $pos;
     while ($run < length($stream) and $run < $rowend) {
@@ -362,7 +466,22 @@ sub encode_color_bits{
     return $term_words->{$run-$pos}, $run
 }
 
-sub decode{
+# FIXME: this should probably be in Bit::Reader
+sub find_next_changing_bit {
+    my ($self, $stream, $pos, $rowend, $color)=@_;
+    print "in find_next_changing_bit with $stream, pos $pos, rowend $rowend, color $color\n";
+    while ($pos < length($stream) and $pos < $rowend) {
+        if (substr($stream, $pos, 1) ne $color or $pos == $rowend) {
+            print "returning $pos\n";
+            return $pos
+        }
+        ++$pos;
+    }
+    print "returning $pos\n";
+    return $pos
+}
+
+sub decode_group3{
     my ($self, $stream, $rows, $columns, %config) = @_;
     print "in decode with ", unpack('B*', $stream), "\n";
     my $k = $config{k} // 0;  # // is defined-or, added in Perl 5.10.
@@ -436,13 +555,115 @@ sub decode{
                 croak "Line is too long (at bit pos $bitr->pos/$bitr->size)"
             }
 
-#            $bitw->write_run( ($current_color << $bit_length) - $current_color, $bit_length );
-            if ($bit_length > 0) {
-                $bitw->write_run( $current_color, $bit_length );
+            $bitw->write_run( $current_color, $bit_length );
+
+            $current_color ^= 1;
+        }
+
+        $rows -= 1;
+        $bitw->flush;
+    }
+    print "returning from decode with ", unpack('B*', $bitw->{data}), "\n";
+    return $bitw->{data}
+}
+
+sub decode_group4{
+    my ($self, $stream, $rows, $columns, %config) = @_;
+    print "in decode_group4 with ", unpack('B*', $stream), "\n";
+    my $k = $config{k} // 0;  # // is defined-or, added in Perl 5.10.
+    my $eol = $config{eol} // 1;
+    my $byteAlign = $config{byteAlign} // 0;
+#    $columns = $config{columns} // 1728;
+#    $rows = $config{rows} // 0;
+    my $eob = $config{eob} // 1;
+    my $blackIs1 = $config{blackIs1} // 0;
+    my $damagedRowsBeforeError = $config{damagedRowsBeforeError} // 0;
+    $byteAlign = 1; # FIXME: this overwrites the value passed to the sub
+        
+    my ($white, $black) = (1,0);
+    if ($blackIs1) {
+        ($white, $black) = (0,1)
+    }            
+    my $bitr = PDF::Builder::Basic::PDF::Filter::CCITTFaxDecode::Bit::Reader->new( $stream );
+    my $bitw = PDF::Builder::Basic::PDF::Filter::CCITTFaxDecode::Bit::Writer->new();
+
+    my $ref = $white x $columns;
+    my $b1 = $columns;
+    my $b2 = $b1;
+
+    print "before while rows=$rows. eod_p ", $bitr->eod_p(), "\n";
+    print "bitr->eod_p() or $rows == 0 ", ($bitr->eod_p() or $rows == 0) ? 1 : 0, "\n";
+    print "not (bitr->eod_p() or $rows == 0) ", not ($bitr->eod_p() or $rows == 0) ? 1 : 0, "\n";
+    while (not ( $bitr->eod_p() or $rows == 0 )){
+        print "in while\n";
+        my $current_color = $white;
+        my $a0 = -1;
+        my $line_length = 0;
+        while ($line_length < $columns){
+            print "in while line_length $line_length $columns columns\n";
+            my ($a1, $bit_length);
+            my $mode = $self->decode_mode($bitr);
+            print "got mode $mode current_color $current_color\n";
+            given ($mode) {
+                when ('H') {
+                    if ($current_color == $white){
+                        $bit_length = $self->decode_white_bits($bitr);
+                        $bitw->write_run( $current_color, $bit_length );
+                        $line_length += $bit_length;
+                        $current_color ^= 1;
+                        $bit_length = $self->decode_black_bits($bitr);
+                    }
+                    else {
+                        $bit_length = $self->decode_black_bits($bitr);
+                        $bitw->write_run( $current_color, $bit_length );
+                        $line_length += $bit_length;
+                        $current_color ^= 1;
+                        $bit_length = $self->decode_white_bits($bitr);
+                    }
+                }
+                when ('V0') {
+                    $a1 = $b1;
+                    $bit_length = $a1 - $line_length;
+                }
+                when ('VR1') {
+                    $a1 = $b1 + 1;
+                    $bit_length = $a1 - $line_length;
+                }
+                when ('VR2') {
+                    $a1 = $b1 + 2;
+                    $bit_length = $a1 - $line_length;
+                }
+                when ('VR3') {
+                    $a1 = $b1 + 3;
+                    $bit_length = $a1 - $line_length;
+                }
+                when ('VL1') {
+                    $a1 = $b1 - 1;
+                    $bit_length = $a1 - $line_length;
+                }
+                when ('VL2') {
+                    $a1 = $b1 - 2;
+                    $bit_length = $a1 - $line_length;
+                }
+                when ('VL3') {
+                    $a1 = $b1 - 3;
+                    $bit_length = $a1 - $line_length;
+                }
+            }
+            print "b1 $b1 a1 $a1 line_length $line_length bit_length $bit_length\n";
+            $bitw->write_run( $current_color, $bit_length );
+
+            if (not defined $bit_length){
+                croak "Unfinished line (at bit pos ", $bitr->pos, '/', $bitr->size, ") , $bitw->{data}"
+            }
+            $line_length += $bit_length;
+            if ($line_length > $columns){
+                croak "Line is too long (at bit pos $bitr->pos/$bitr->size)"
             }
 
             $current_color ^= 1
         }
+        print "finished line\n";
 
         $rows -= 1;
         $bitw->flush;
@@ -500,6 +721,20 @@ sub decode_color_bits{
               }
         }
     }
+    return
+}
+
+sub decode_mode{
+    my ($self, $bitr)=@_;
+    for my $i (1..7){
+        my $codeword = $bitr->peek($i);
+        my $mode = $MODE_DECODE_TABLE{"$codeword $i"};
+        if (defined $mode){
+            $bitr->pos($bitr->pos + $i);
+            return $mode
+        }
+    }
+    croak "Unable to decode mode";
     return
 }
 
@@ -576,6 +811,9 @@ sub write {
 sub write_run {
     my ($self, $data, $length) = @_;
     print "in write_run with data $data length $length last_byte $self->{last_byte}\n";
+    if ($length == 0) {
+        return
+    }
     $self->write($data x $length);
     print "after last_byte $self->{last_byte}\n";
     return;
@@ -618,8 +856,8 @@ sub eod_p {
 
 sub size {
     my ($self) = @_;
-    print "bytes ", length($self->{data}), "\n";
-    print "size returning ", length($self->{data}) << 3, "\n";
+#    print "bytes ", length($self->{data}), "\n";
+#    print "size returning ", length($self->{data}) << 3, "\n";
     return length($self->{data}) << 3
 }
 
@@ -642,7 +880,7 @@ sub pos {
 
 sub peek {
     my ($self, $length) = @_;
-    print "peeking length $length from pos ", $self->pos, " available ", $self->size, "\n";
+#    print "peeking length $length from pos ", $self->pos, " available ", $self->size, "\n";
     if ($length <= 0){
         croak "Invalid read length"
     }
@@ -668,7 +906,7 @@ sub peek {
             $length = 0
         }
     }
-    print "peek returning $n\n";
+#    print "peek returning $n\n";
     return $n
 }
 
